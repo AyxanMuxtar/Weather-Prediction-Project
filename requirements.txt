@@ -1,0 +1,12 @@
+duckdb
+requests
+pandas
+numpy
+matplotlib
+seaborn
+scipy
+statsmodels
+scikit-learn
+pyarrow
+missingno
+notebook
