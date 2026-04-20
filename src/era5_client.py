@@ -90,14 +90,14 @@ def fetch_marine(
     pd.DataFrame with DatetimeIndex and daily aggregated marine variables.
     """
     variables = variables or MARINE_VARIABLES
-    
+
     # FIX: Open-Meteo Marine API requires these variables to be queried as 'hourly'
     params = {
         "latitude":   lat,
         "longitude":  lon,
         "start_date": start,
         "end_date":   end,
-        "hourly":     ",".join(variables), 
+        "hourly":     ",".join(variables),
         "timezone":   timezone,
     }
 
@@ -105,7 +105,7 @@ def fetch_marine(
         "Fetching ERA5 marine hourly and aggregating to daily %s → %s  (%.2f, %.2f)",
         start, end, lat, lon
     )
-    
+
     resp = _SESSION.get(MARINE_HISTORICAL_URL, params=params, timeout=30)
     resp.raise_for_status()
 
@@ -135,13 +135,13 @@ def fetch_marine(
         "swell_wave_direction": "median",
         "swell_wave_period": "max",
     }
-    
+
     # Only apply rules for the variables actually requested
     current_agg_rules = {k: v for k, v in agg_rules.items() if k in variables}
-    
+
     # Resample to Daily ('D')
     df_daily = df_hourly.resample('D').agg(current_agg_rules)
-    
+
     return df_daily
 
 
