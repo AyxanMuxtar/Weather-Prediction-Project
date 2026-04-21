@@ -1,34 +1,27 @@
-# ── Core ──────────────────────────────────────────────────────────────────────
+# ── Core — required ───────────────────────────────────────────────────────────
 pandas>=2.1.0
 numpy>=1.26.0
 scipy>=1.11.0
-
-# ── HTTP & caching ────────────────────────────────────────────────────────────
 requests>=2.31.0
-requests-cache>=1.1.1      # optional but recommended — disk cache for API calls
-retry-requests>=2.0.0      # optional — auto-retry on network errors
+PyYAML>=6.0
 
-# ── Data storage ──────────────────────────────────────────────────────────────
-duckdb>=0.10.0
-pyarrow>=14.0.0
-
-# ── Visualisation ─────────────────────────────────────────────────────────────
+# ── Visualisation — required ──────────────────────────────────────────────────
 matplotlib>=3.8.0
 seaborn>=0.13.0
-plotly>=5.18.0
 
-# ── Machine learning (Days 6–7) ───────────────────────────────────────────────
+# ── Caching & retry — optional (graceful fallback if absent) ──────────────────
+requests-cache>=1.1.1
+retry-requests>=2.0.0
+
+# ── Storage — optional (CSV used as fallback if absent) ───────────────────────
+pyarrow>=14.0.0        # enables Parquet; not required — CSV works without it
+duckdb>=0.10.0         # used from Day 3+ for SQL queries over CSV files
+
+# ── Machine learning — Days 6–7 ───────────────────────────────────────────────
 scikit-learn>=1.4.0
 xgboost>=2.0.0
 
-# ── Notebook ──────────────────────────────────────────────────────────────────
+# ── Notebooks ─────────────────────────────────────────────────────────────────
 jupyterlab>=4.0.0
 ipywidgets>=8.1.0
 tqdm>=4.66.0
-
-# ── Utilities ─────────────────────────────────────────────────────────────────
-python-dateutil>=2.8.2
-
-# ── ERA5 via Copernicus CDS (optional — only needed for pressure-level data) ──
-# Register at https://cds.climate.copernicus.eu and create ~/.cdsapirc
-# cdsapi>=0.6.1

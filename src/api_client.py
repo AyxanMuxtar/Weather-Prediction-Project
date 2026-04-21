@@ -46,11 +46,6 @@ logger = logging.getLogger(__name__)
 HISTORICAL_URL = 'https://archive-api.open-meteo.com/v1/archive'
 FORECAST_URL   = 'https://api.open-meteo.com/v1/forecast'
 
-# ── Cached session ─────────────────────────────────────────────────────────────
-_cache_dir = Path(__file__).parent.parent / '.weather_cache'
-_cache_session = requests_cache.CachedSession(str(_cache_dir), expire_after=3600)
-SESSION = _retry(_cache_session, retries=5, backoff_factor=0.2)
-
 # ── City registry ─────────────────────────────────────────────────────────────
 CITIES: dict[str, dict] = {
     'Baku':          {'lat': 40.41, 'lon': 49.87, 'country': 'Azerbaijan'},

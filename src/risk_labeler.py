@@ -26,15 +26,17 @@ _DEFAULT_THRESHOLDS: dict[str, float] = {
     "wind_gusts_10m_max": 75.0,   # km/h
     "precipitation_sum":  15.0,   # mm/day
     "snowfall_sum":        5.0,   # cm/day
-    "visibility_mean":  1000.0,   # metres  (BELOW threshold = risk)
-    # ERA5 additions (Day 2+):
-    # "wave_height_max":   2.5,   # metres
+    "wave_height":         2.5,   # metres  (ERA5 marine)
+    # visibility_mean removed: Open-Meteo archive returns null at Caspian coords.
+    # Fog risk is captured via fog_proxy_flag feature added in Day 4:
+    #   (relative_humidity_2m_mean >= 90) AND (temp_2m_mean - dew_point_2m_mean <= 2)
 }
 
 _DEFAULT_HIGH_RISK_DAYS: int = 5   # days/month → label = 1
 
 # Variables where LOWER value = higher risk (all others: higher = risk)
-_BELOW_THRESHOLD_VARS: set[str] = {"visibility_mean"}
+# visibility_mean removed — see note above
+_BELOW_THRESHOLD_VARS: set[str] = set()
 
 
 def label_risk_days(
