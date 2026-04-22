@@ -36,3 +36,5 @@ daily-briefs/
 readme.md
 README.md
 
+*.duckdb
+
