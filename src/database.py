@@ -168,6 +168,14 @@ def load_raw_data(
 
     # ── Weather historical ────────────────────────────────────────────────────
     weather_files = sorted(data_dir.glob("*_historical_*.csv"))
+
+    # If city-specific files exist, skip combined all_cities files to avoid duplicates.
+    city_specific_weather = [
+        f for f in weather_files
+        if not f.name.startswith("all_cities_")
+    ]
+    if city_specific_weather:
+        weather_files = city_specific_weather
     if weather_files:
         for f in weather_files:
             # Read CSV header to determine which columns are present
@@ -188,7 +196,7 @@ def load_raw_data(
             select_expr = ", ".join(present)
 
             conn.execute(f"""
-                INSERT INTO raw.weather_daily ({select_expr})
+                INSERT OR IGNORE INTO raw.weather_daily ({select_expr})
                 SELECT {select_expr}
                 FROM read_csv_auto('{f}', header=true, dateformat='%Y-%m-%d')
             """)
@@ -202,7 +210,7 @@ def load_raw_data(
                 # Only insert rows where visibility data exists (non-null)
                 where_clause = " OR ".join(f"{c} IS NOT NULL" for c in vis_present)
                 conn.execute(f"""
-                    INSERT INTO raw.visibility_daily ({vis_select})
+                    INSERT OR IGNORE INTO raw.visibility_daily ({vis_select})
                     SELECT {vis_select}
                     FROM read_csv_auto('{f}', header=true, dateformat='%Y-%m-%d')
                     WHERE {where_clause}
