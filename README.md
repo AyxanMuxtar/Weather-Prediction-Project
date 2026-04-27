@@ -27,8 +27,8 @@ weather-driven disruption for the Caspian. **This project builds one.**
 
 The model answers a single question, asked once per month:
 
-> *"For each of our five ports, what is the probability that next month will
-> have at least 5 days with weather conditions severe enough to disrupt
+> *"For each of our five ports, what is the probability that each day of next month will
+> have weather conditions severe enough to disrupt
 > normal maritime operations?"*
 
 ## 2. Why It Matters
