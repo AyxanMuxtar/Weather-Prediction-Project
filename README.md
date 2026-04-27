@@ -48,14 +48,27 @@ classifier — even one based on threshold heuristics — fills a real gap.
 
 ## 3. Target Variable
 
+The model predicts at **daily granularity**, but the user-facing output is **monthly** — for any upcoming calendar month, you get one row per (city × day) telling you whether that specific day will be a delay-risk day.
+
+### Primary target — daily
+
+| Property | Value |
+|----------|-------|
+| **Name** | `is_risk_day` |
+| **Type** | Binary classification (0 / 1) |
+| **Definition** | `1` if the day's weather breaches any of the 8 thresholds below |
+| **Granularity** | One label per (city × day) |
+| **Total training samples** | ~18,265 city-days (5 cities × 3,653 days across 2015–2024) |
+
+### Derived target — monthly
+
 | Property | Value |
 |----------|-------|
 | **Name** | `high_risk_month` |
-| **Type** | Binary classification (0 / 1) |
-| **Definition** | `1` if the calendar month contained ≥ **5 delay-risk days**, else `0` |
+| **Type** | Binary (0 / 1) computed from daily predictions, not a separate model |
+| **Definition** | `1` if predicted risk-days ≥ `HIGH_RISK_MONTH_THRESHOLD` (default 5) |
 | **Granularity** | One label per (city × calendar month) |
-| **Total samples** | ~600 city-months (5 cities × 120 months across 2015–2024) |
-| **Threshold** | Configurable via `HIGH_RISK_MONTH_THRESHOLD` in `src/config.py` |
+| **Probability** | Estimated by Monte Carlo over per-day probabilities (Poisson-binomial) |
 
 A **delay-risk day** is any calendar day where *any* of the following thresholds is breached:
 
@@ -142,13 +155,21 @@ Computed in `analytics.monthly_summary` via SQL window functions:
 
 ## 5. Prediction Horizon
 
+The output covers a full calendar month, but the prediction strategy splits the month at the 16-day mark:
+
+| Days | Prediction source | Why |
+|------|-------------------|-----|
+| **1–16** | `DailyClassifier` fed by Open-Meteo's free 16-day forecast (real model output) | Forecast features have genuine atmospheric skill in this window |
+| **17–end of month** | `ClimatologyTable` lookup — per-(city, day-of-year) historical positive rate over the 2015–2024 base period, smoothed with a ±7-day rolling window | Beyond ~14 days, free deterministic weather forecasts converge toward climatology anyway. We make this explicit instead of pretending we have skill we don't |
+
+Each prediction row is tagged with a `source` column (`short_horizon` or `climatology`) so downstream consumers know how much to trust each value.
+
 | Aspect | Value |
 |--------|-------|
-| **Horizon** | 1 calendar month |
-| **Cadence** | Monthly (model retrains and predicts on the 1st of each month) |
-| **Input window** | Previous month's daily features + seasonal context |
-| **Output** | One probability per port for the upcoming month |
-| **Use case** | Logistics planning 2–4 weeks in advance |
+| **Horizon** | Full upcoming calendar month (~30 days) |
+| **Cadence** | Monthly cron via GitHub Actions, on the 1st of each month at 06:00 UTC |
+| **Output** | `predictions/YYYY-MM/daily.csv` (per-day) + `predictions/YYYY-MM/monthly.csv` (summary) |
+| **Use case** | Operational planning for the next 16 days; medium-term planning informed by climatology for days 17+ |
 
 ## 6. Dataset
 
@@ -230,7 +251,7 @@ Computed in `analytics.monthly_summary` via SQL window functions:
 
 This is an 8-day sprint. Days 1–5 (Week 1: Data Engineering) are complete.
 
-### April 20 — Project Setup & API Exploration
+### Day 1 — Project Setup & API Exploration
 - Identified five target ports and their coordinates
 - Mapped Open-Meteo Archive API endpoints, variables, and rate limits
 - Explored visibility availability (discovered ERA5 archive does not serve it for the Caspian)
@@ -238,7 +259,7 @@ This is an 8-day sprint. Days 1–5 (Week 1: Data Engineering) are complete.
 - Bootstrapped `src/api_client.py` and the initial `src/config.py`
 - **Deliverable**: `notebooks/day_01_exploration.ipynb`
 
-### April 21 — Production Ingestion
+### Day 2 — Production Ingestion
 - Built `src/ingestion.py` — production HTTP client using stdlib `urllib` only (no `requests` dependency)
 - Implemented retry logic with exponential backoff and `Retry-After` header handling for HTTP 429
 - Added per-city delay between fetches to stay under Open-Meteo rate limits
@@ -249,7 +270,7 @@ This is an 8-day sprint. Days 1–5 (Week 1: Data Engineering) are complete.
 - Added per-city directional fetch lookup table (`CASPIAN_FETCH_KM`) for SMB wave estimation
 - **Deliverable**: `notebooks/day_02_ingestion.ipynb`, complete raw data in `data/raw/`
 
-### April 22 — Database Design
+### Day 3 — Database Design
 - Designed three-layer schema: `raw`, `staging`, `analytics`
 - Built `src/database.py` with: `get_connection`, `create_schemas`, `create_raw_tables`, `load_raw_data`, `build_staging`, `build_analytics`, `validate_database`, `run_query`, `build_database`
 - Auto-detection of CSV files by naming pattern (weather, hourly visibility, forecasts)
@@ -257,7 +278,7 @@ This is an 8-day sprint. Days 1–5 (Week 1: Data Engineering) are complete.
 - 8 analytical SQL queries demonstrating the database works (avg temp by year, precipitation variance, top hottest days, dry days, risk seasonality, trigger frequency, monthly heatmap, high-risk months by year)
 - **Deliverable**: `notebooks/day_03_database.ipynb`
 
-### April 23 — Cleaning & Feature Engineering
+### Day 4 — Cleaning & Feature Engineering
 - Built `src/cleaning.py` — 5 functions: `handle_missing_values()`, `flag_outliers()`, `validate_date_continuity()`, `winsorize_by_city()`, `clean_raw_to_staging()`
 - Built `src/features.py` — 9 functions covering rolling, seasonal, range, degree-days, anomaly, lag, wave-proxy, full-pipeline orchestrator, analytics-layer builder
 - **Decision: per-city precipitation winsorizing** (Anzali = 60mm cap, others 25–40mm) to prevent one wet station from dominating cross-city statistics
@@ -269,7 +290,7 @@ This is an 8-day sprint. Days 1–5 (Week 1: Data Engineering) are complete.
 - Wrote `reports/data_quality_report.md` — formal 5-section trust assessment
 - **Deliverable**: `notebooks/day_04_cleaning.ipynb`
 
-### April 24 — Pipeline Automation & Quality Gates
+### Day 5 — Pipeline Automation & Quality Gates
 - Built `src/pipeline.py` — single-CLI orchestrator with `--mode full`, `--mode incremental`, `--since`, `--dry-run`, `--no-train`, `--no-predict`, `--strict-freshness` flags
 - Built `src/quality_checks.py` — 6 automated quality gates: `row_count` (ABORT), `null_ratio` (WARN), `date_continuity` (WARN), `value_ranges` (FLAG), `feature_completeness` (WARN), `freshness_monthly` (WARN)
 - Added incremental loading: `INSERT OR REPLACE` in `src/database.py`, per-city max-date detection in pipeline, 3-day overlap window for self-healing
@@ -298,13 +319,26 @@ This is an 8-day sprint. Days 1–5 (Week 1: Data Engineering) are complete.
 
 ### Days 6–8 (planned)
 
-- **Day 6** — Model training: replace `BaselinePredictor` with XGBoost or Random Forest. Stratified k-fold CV. Class balance assessment. Feature importance analysis.
-- **Day 7** — Evaluation: ROC-AUC, Brier score, calibration curves, per-city performance, error analysis.
-- **Day 8** — Deployment: live forecast pipeline that consumes the 7-day forecast endpoint, generates a near-term risk score, ships predictions through the GitHub Actions cron.
+- **Day 6** — Model training: replace `DailyClassifier`'s baseline internals with XGBoost. Train on `analytics.daily_enriched` with `is_risk_day` as the target. Stratified k-fold CV (group by city to avoid leakage). Class balance assessment. Feature importance analysis. The orchestration code in `predict_next_month()` does NOT need to change — only the classifier internals.
+- **Day 7** — Evaluation: ROC-AUC, Brier score, calibration curves, per-city performance, error analysis. Also evaluate the climatology baseline as a benchmark — the daily model needs to clearly beat climatology at its 16-day horizon to justify itself.
+- **Day 8** — Deployment polish: confirm the live `fetch_forecast` integration works in production. Consider adding a small static site that renders the latest `predictions/YYYY-MM/daily.csv` as a calendar view.
+
+### Day 5 addendum — Daily-then-Monthly prediction strategy
+
+Mid-Day 5, the prediction strategy was switched from "monthly classifier" to "daily classifier with monthly aggregation":
+
+- The user-facing output is now **monthly with daily breakdown** (one row per city × day for the upcoming month)
+- The model itself predicts at daily granularity, trained on `analytics.daily_enriched`
+- Days 1–16 use the model with real Open-Meteo forecast features
+- Days 17+ use the per-(city, day-of-year) climatology lookup, computed once during the train stage
+- The monthly summary (`risk_days_predicted`, `high_risk_month_probability`) is **derived** from daily predictions, not a separate model
+- The monthly cron schedule is unchanged
 
 ## 10. Team & Roles
 
-team name: Anemoi
+
+### Team Name: Anemoi
+
 ### Roles:
 
 ### 1. Məhəmməd Sadıqov, Adil Həsənov - Data Engineer
