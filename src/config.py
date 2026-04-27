@@ -195,6 +195,14 @@ RISK_THRESHOLDS: dict[str, float] = {
 # Months with >= this many risk days are labelled 1 (high-risk month)
 HIGH_RISK_MONTH_THRESHOLD: int = 5
 
+# ── Prediction horizon ───────────────────────────────────────────────────────
+# Open-Meteo's free forecast endpoint provides up to 16 days of forecast features.
+# We use the model on those 16 days and per-(city, day-of-year) climatology for
+# the remaining days of the target month (so the user-facing output covers a
+# full calendar month).
+FORECAST_HORIZON_DAYS: int = 16    # how many days the short-horizon model covers
+MAX_MONTH_DAYS: int       = 31     # upper bound used when allocating arrays
+
 # ── Outlier handling (Day 4) ─────────────────────────────────────────────────
 # Columns where outliers are flagged (NOT removed) using IQR method.
 # Removal is a modelling-time decision, not a cleaning-time one.

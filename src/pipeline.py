@@ -62,7 +62,9 @@ from src.quality_checks import (
     run_all_checks, format_check_report, any_aborting,
     ABORT, WARN, FLAG,
 )
-from src.modeling import train_model, predict_next_month, save_predictions
+from src.modeling import (
+    train_model, build_climatology, predict_next_month, save_predictions,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -309,31 +311,56 @@ def stage_features(conn, dry_run: bool = False) -> dict:
     return result
 
 
-def stage_train(conn, model_path: Path, dry_run: bool = False) -> dict:
+def stage_train(conn, model_path: Path, climatology_path: Path,
+                dry_run: bool = False) -> dict:
     log = logging.getLogger("stage.train")
-    log.info("=== STAGE 5: Train model ===")
+    log.info("=== STAGE 5: Train daily model + build climatology ===")
 
     if dry_run:
         return {"rows_trained": 0, "model_path": str(model_path)}
 
-    metrics = train_model(conn, model_path=model_path)
-    log.info("  %s", metrics)
-    return metrics
+    train_metrics = train_model(conn, model_path=model_path)
+    clim_info     = build_climatology(conn, climatology_path=climatology_path)
+    log.info("  Train: %s", train_metrics)
+    log.info("  Climatology: %s", clim_info)
+    return {"train": train_metrics, "climatology": clim_info}
 
 
-def stage_predict(conn, model_path: Path, preds_dir: Path,
-                  dry_run: bool = False) -> dict:
+def stage_predict(conn, model_path: Path, climatology_path: Path,
+                  preds_dir: Path, dry_run: bool = False) -> dict:
     log = logging.getLogger("stage.predict")
-    log.info("=== STAGE 6: Predict next month ===")
+    log.info("=== STAGE 6: Predict next month (daily granularity) ===")
 
     if dry_run:
         return {"target_month": None, "rows": 0}
 
-    preds = predict_next_month(conn, model_path=model_path)
-    saved = save_predictions(preds, out_dir=preds_dir)
-    target = preds["target_month"].iloc[0]
-    log.info("  %d predictions for %s → %s", len(preds), target, saved)
-    return {"target_month": target, "rows": len(preds), "file": str(saved)}
+    daily_df, monthly_df = predict_next_month(
+        conn,
+        model_path=model_path,
+        climatology_path=climatology_path,
+    )
+    target = str(monthly_df["target_month"].iloc[0]) if len(monthly_df) else None
+    daily_path, monthly_path = save_predictions(
+        daily_df, monthly_df, target_month=target, out_dir=preds_dir,
+    )
+
+    n_short = int((daily_df["source"] == "short_horizon").sum())
+    n_clim  = int((daily_df["source"] == "climatology").sum())
+    log.info(
+        "  %d daily rows for %s (short_horizon=%d, climatology=%d)",
+        len(daily_df), target, n_short, n_clim,
+    )
+    log.info("  Monthly summary: %d cities", len(monthly_df))
+
+    return {
+        "target_month":              target,
+        "daily_rows":                len(daily_df),
+        "monthly_rows":              len(monthly_df),
+        "n_short_horizon_days":      n_short,
+        "n_climatology_days":        n_clim,
+        "daily_path":                str(daily_path),
+        "monthly_path":              str(monthly_path),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -377,8 +404,9 @@ def run_pipeline(
 
     db_path  = Path(db_path)  if db_path  else PATHS["repo_root"] / "data" / "caspian_weather.duckdb"
     data_dir = Path(data_dir) if data_dir else PATHS["data_raw"]
-    model_path = PATHS["models"] / "latest.pkl"
-    preds_dir  = PATHS["repo_root"] / "predictions"
+    model_path        = PATHS["models"] / "daily_model.pkl"
+    climatology_path  = PATHS["models"] / "climatology.pkl"
+    preds_dir         = PATHS["repo_root"] / "predictions"
 
     start_time = datetime.now()
     summary = {
@@ -463,13 +491,35 @@ def run_pipeline(
 
         # ── STAGE 5: Train ────────────────────────────────────────────────────
         if not skip_train and not dry_run:
-            train_metrics = stage_train(conn, model_path, dry_run)
+            train_metrics = stage_train(conn, model_path, climatology_path, dry_run)
             summary["train_metrics"] = train_metrics
 
         # ── STAGE 6: Predict ─────────────────────────────────────────────────
         if not skip_predict and not skip_train and not dry_run:
-            pred = stage_predict(conn, model_path, preds_dir, dry_run)
-            summary["predictions_for"] = pred.get("target_month", "")
+            pred = stage_predict(
+                conn, model_path, climatology_path, preds_dir, dry_run,
+            )
+            summary["predictions_for"]        = pred.get("target_month", "")
+            summary["n_short_horizon_days"]   = pred.get("n_short_horizon_days", 0)
+            summary["n_climatology_days"]     = pred.get("n_climatology_days", 0)
+
+            # Gate: predictions completeness — read the daily.csv we just wrote
+            try:
+                import pandas as pd
+                daily_path = pred.get("daily_path")
+                if daily_path:
+                    daily_df = pd.read_csv(daily_path)
+                    pred_results = run_all_checks(
+                        conn, stage="predict",
+                        predictions_df=daily_df,
+                        expected_cities=list(CITIES.keys()),
+                    )
+                    pred_report = format_check_report(pred_results)
+                    for line in pred_report.splitlines():
+                        log.info("  %s", line)
+                    all_check_results.extend(pred_results)
+            except Exception as e:
+                log.warning("Predictions gate failed to run: %s", e)
 
         summary["status"] = "SUCCESS"
 

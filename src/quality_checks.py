@@ -351,17 +351,104 @@ def check_freshness_monthly(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 7. Predictions completeness (WARN — runs after predict stage)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def check_predictions_completeness(daily_df, expected_cities: list[str]) -> dict:
+    """
+    Verify the predictions DataFrame:
+      - Covers every expected city
+      - Covers every day of its target month (no gaps)
+      - Has valid source flags (only 'short_horizon' or 'climatology')
+      - Has probabilities in [0, 1]
+    """
+    import pandas as pd
+
+    issues = []
+    if len(daily_df) == 0:
+        return {
+            "check_name": "predictions_completeness",
+            "status":     "FAIL",
+            "severity":   WARN,
+            "stage":      "predict",
+            "details":    {},
+            "message":    "Predictions DataFrame is empty",
+        }
+
+    # City coverage
+    cities_in = set(daily_df["city"].unique())
+    cities_expected = set(expected_cities)
+    if cities_in != cities_expected:
+        missing = cities_expected - cities_in
+        extra   = cities_in - cities_expected
+        if missing:
+            issues.append(f"missing cities: {sorted(missing)}")
+        if extra:
+            issues.append(f"unexpected cities: {sorted(extra)}")
+
+    # Day coverage per city
+    dates = pd.to_datetime(daily_df["date"])
+    target_month = dates.dt.strftime("%Y-%m").iloc[0]
+    expected_days = pd.Period(target_month).days_in_month
+    by_city = daily_df.groupby("city").size()
+    bad_cities = by_city[by_city != expected_days].to_dict()
+    if bad_cities:
+        issues.append(
+            f"day count mismatch (expected {expected_days}): {bad_cities}"
+        )
+
+    # Source flag validity
+    valid_sources = {"short_horizon", "climatology"}
+    bad_sources = set(daily_df["source"].unique()) - valid_sources
+    if bad_sources:
+        issues.append(f"invalid source flags: {bad_sources}")
+
+    # Probability range
+    bad_probs = daily_df[
+        (daily_df["probability"] < 0) | (daily_df["probability"] > 1)
+    ]
+    if len(bad_probs) > 0:
+        issues.append(f"{len(bad_probs)} probabilities outside [0, 1]")
+
+    passed = len(issues) == 0
+    return {
+        "check_name": "predictions_completeness",
+        "status":     "PASS" if passed else "WARN",
+        "severity":   WARN,
+        "stage":      "predict",
+        "details":    {
+            "rows":           len(daily_df),
+            "target_month":   target_month,
+            "expected_days":  expected_days,
+            "cities":         sorted(cities_in),
+            "by_source":      daily_df["source"].value_counts().to_dict(),
+        },
+        "message":    "All predictions cover their target month cleanly"
+                      if passed else
+                      f"Issues: {'; '.join(issues)}",
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 7. Batch runner & pretty-print
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_all_checks(conn, stage: str, monthly: bool = True) -> list[dict]:
+def run_all_checks(
+    conn,
+    stage:           str,
+    monthly:         bool = True,
+    predictions_df       = None,
+    expected_cities: list[str] | None = None,
+) -> list[dict]:
     """
     Run all checks relevant to a given pipeline stage.
 
     Parameters
     ----------
-    stage   : 'raw' | 'staging' | 'analytics'
-    monthly : Use the 35-day freshness check instead of the 2-day one
+    stage           : 'raw' | 'staging' | 'analytics' | 'predict'
+    monthly         : Use the 35-day freshness check instead of the 2-day one
+    predictions_df  : Daily predictions DataFrame (required for stage='predict')
+    expected_cities : List of city names (required for stage='predict')
     """
     results = []
 
@@ -379,6 +466,15 @@ def run_all_checks(conn, stage: str, monthly: bool = True) -> list[dict]:
 
     elif stage == "analytics":
         results.append(check_feature_completeness(conn))
+
+    elif stage == "predict":
+        if predictions_df is None or expected_cities is None:
+            raise ValueError(
+                "stage='predict' requires predictions_df and expected_cities"
+            )
+        results.append(
+            check_predictions_completeness(predictions_df, expected_cities)
+        )
 
     else:
         raise ValueError(f"Unknown stage: {stage!r}")

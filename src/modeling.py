@@ -1,32 +1,48 @@
 """
 src/modeling.py
 ───────────────
-Model training + prediction for the Caspian Maritime Delay-Risk project.
+Daily delay-risk prediction pipeline.
 
-**Day 5 version: PLACEHOLDER implementation.**
+Two-component prediction strategy
+---------------------------------
+The user-facing output is **monthly** (one CSV per upcoming calendar month
+covering all ~30 days), but the model itself works at daily granularity:
 
-The functions have the correct signatures and produce the correct output
-shape — but the model itself is a trivial baseline (predicts the long-run
-per-city positive-class rate). Day 6 will replace the internals with a
-real XGBoost / Random Forest classifier, keeping the same signatures so
-the pipeline doesn't need to change.
+    Days 1–16 of horizon  →  DailyClassifier (XGBoost in Day 6, baseline now)
+                              fed real Open-Meteo 16-day forecast features
+    Days 17 onwards       →  ClimatologyTable lookup
+                              per-(city, day-of-year) historical positive rate
+
+Each prediction row is tagged with a `source` column ('short_horizon' or
+'climatology') so downstream consumers know how much to trust it.
+
+The monthly summary CSV is **derived** from the daily predictions — it is not
+a separate model. It just counts predicted risk days per (city × month) and
+estimates P(high_risk_month) via Monte Carlo over the daily probabilities.
+
+**Day 5 status: PLACEHOLDER `DailyClassifier`.** The `BaselinePredictor`
+class predicts the per-(city, month) historical positive rate. Day 6 will
+swap its internals for XGBoost / RandomForest while keeping the same
+.fit(X, y) / .predict_proba(X) interface so the rest of the pipeline
+needs no changes.
 
 Public API
 ----------
-    train_model(conn, model_path)                → dict   (metrics)
-    predict_next_month(conn, model_path, month)  → pd.DataFrame (predictions)
-    load_model(model_path)                       → object (pickled model)
-
-The pipeline calls these in sequence:
-    metrics = train_model(conn, "models/latest.pkl")
-    preds   = predict_next_month(conn, "models/latest.pkl", next_month)
-    preds.to_csv("predictions/YYYY-MM.csv")
+    train_model(conn, model_path)                     → dict (metrics)
+    build_climatology(conn, climatology_path)         → dict (lookup info)
+    predict_next_month(conn, model_path, climatology_path,
+                       target_month, ...)             → tuple[DataFrame, DataFrame]
+    save_predictions(daily_df, monthly_df, target_month, out_dir)
+                                                      → tuple[Path, Path]
+    load_model(path)                                   → object | None
 """
 
 from __future__ import annotations
 
 import logging
 import pickle
+from calendar import monthrange
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -37,45 +53,54 @@ logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. Placeholder model class
+# 1. DailyClassifier — placeholder for Day 6's real model
 # ══════════════════════════════════════════════════════════════════════════════
 
-class BaselinePredictor:
+class DailyClassifier:
     """
-    Per-city base-rate predictor: predicts the long-run fraction of
-    high-risk months observed in training.
+    Predict P(is_risk_day = 1) given daily weather features.
 
-    A real model (XGBoost / RandomForest) will replace this class in Day 6.
-    The interface is the same: .fit(X, y), .predict_proba(X).
+    Day 5 implementation: per-(city, calendar_month) base rate.
+    Day 6 will replace the internals with XGBoost / RandomForest while
+    keeping the same .fit() / .predict_proba() interface.
+
+    Required input columns
+    ----------------------
+    X must contain at minimum:
+        - city
+        - month   (1..12; integer)
+    All other columns are accepted and ignored by the baseline.
+    The real Day 6 model will use the full feature set.
     """
 
     def __init__(self):
-        self.city_rates: dict[str, float] = {}
+        self.rates: dict[tuple[str, int], float] = {}
         self.global_rate: float = 0.5
         self.trained_on_rows: int = 0
-        self.trained_on_months: int = 0
 
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> "BaselinePredictor":
-        """Learn per-city positive-class rate from the training set."""
-        if "city" not in X.columns:
-            raise ValueError("X must contain a 'city' column")
-
-        df = X[["city"]].copy()
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "DailyClassifier":
+        if "city" not in X.columns or "month" not in X.columns:
+            raise ValueError("X must contain 'city' and 'month' columns")
+        df = X[["city", "month"]].copy()
         df["_y"] = y.values
-        self.city_rates = df.groupby("city")["_y"].mean().to_dict()
+        grouped = df.groupby(["city", "month"])["_y"].mean()
+        self.rates = grouped.to_dict()
         self.global_rate = float(df["_y"].mean())
         self.trained_on_rows = len(df)
-        self.trained_on_months = len(df)
-
-        logger.info("  BaselinePredictor fit: %d months across %d cities",
-                    self.trained_on_rows, len(self.city_rates))
+        logger.info(
+            "  DailyClassifier fit on %d rows; %d (city,month) cells; "
+            "global positive rate = %.3f",
+            self.trained_on_rows, len(self.rates), self.global_rate,
+        )
         return self
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        """Return per-row probability of class=1."""
-        if "city" not in X.columns:
-            raise ValueError("X must contain a 'city' column")
-        probs = X["city"].map(self.city_rates).fillna(self.global_rate).values
+        if "city" not in X.columns or "month" not in X.columns:
+            raise ValueError("X must contain 'city' and 'month' columns")
+
+        keys = list(zip(X["city"].values, X["month"].astype(int).values))
+        probs = np.array([self.rates.get(k, self.global_rate) for k in keys],
+                         dtype=float)
         # sklearn convention: shape (n, 2) with [P(0), P(1)]
         return np.column_stack([1 - probs, probs])
 
@@ -84,165 +109,507 @@ class BaselinePredictor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. Train
+# 2. ClimatologyTable — per-(city, day-of-year) historical base rate
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ClimatologyTable:
+    """
+    Lookup of P(is_risk_day = 1) by (city, day-of-year).
+
+    Built once from the full historical analytics.daily_enriched table.
+    Used for predictions beyond the 16-day forecast horizon.
+
+    Smoothing: predictions for day-of-year d are computed as the mean over
+    a centred ±N-day window in the historical data. This stabilises against
+    the high variance you'd otherwise get from individual calendar days.
+    """
+
+    def __init__(self, smoothing_window: int = 7):
+        self.smoothing_window = smoothing_window
+        self.rates: dict[tuple[str, int], float] = {}
+        self.global_rate: float = 0.5
+        self.trained_on_rows: int = 0
+
+    def fit(self, df: pd.DataFrame) -> "ClimatologyTable":
+        """
+        df must contain: city, date (or day_of_year), is_risk_day.
+        """
+        if "city" not in df.columns or "is_risk_day" not in df.columns:
+            raise ValueError("df must contain 'city' and 'is_risk_day' columns")
+
+        df = df.copy()
+        if "day_of_year" not in df.columns:
+            df["day_of_year"] = pd.to_datetime(df["date"]).dt.dayofyear
+        df["day_of_year"] = df["day_of_year"].astype(int)
+
+        # Per-(city, day_of_year) raw rate
+        raw_rates = (
+            df.groupby(["city", "day_of_year"])["is_risk_day"]
+              .mean()
+              .reset_index(name="rate")
+        )
+
+        # Apply circular rolling-mean smoothing over ±smoothing_window days
+        # (so day 365 wraps around to day 1)
+        smoothed_rows = []
+        for city, sub in raw_rates.groupby("city"):
+            # Build a length-366 array indexed by day_of_year
+            arr = np.full(367, np.nan)
+            for _, r in sub.iterrows():
+                arr[int(r["day_of_year"])] = r["rate"]
+            # Forward-fill any NaN holes from the historical data
+            mask = np.isnan(arr[1:367])
+            if mask.any():
+                vals = arr[1:367]
+                last_good = np.nan
+                for i in range(366):
+                    if not np.isnan(vals[i]):
+                        last_good = vals[i]
+                    elif not np.isnan(last_good):
+                        vals[i] = last_good
+                arr[1:367] = vals
+            # Circular rolling mean
+            w = self.smoothing_window
+            padded = np.concatenate([arr[1:367][-w:], arr[1:367], arr[1:367][:w]])
+            kernel = np.ones(2 * w + 1) / (2 * w + 1)
+            smoothed = np.convolve(padded, kernel, mode="valid")
+            for doy in range(1, 367):
+                smoothed_rows.append({
+                    "city":         city,
+                    "day_of_year":  doy,
+                    "rate":         float(smoothed[doy - 1]),
+                })
+
+        smoothed_df = pd.DataFrame(smoothed_rows)
+        self.rates = {
+            (r["city"], int(r["day_of_year"])): float(r["rate"])
+            for _, r in smoothed_df.iterrows()
+        }
+        self.global_rate = float(df["is_risk_day"].mean())
+        self.trained_on_rows = len(df)
+
+        logger.info(
+            "  ClimatologyTable built from %d rows; %d entries; "
+            "smoothing ±%d days; global rate = %.3f",
+            self.trained_on_rows, len(self.rates),
+            self.smoothing_window, self.global_rate,
+        )
+        return self
+
+    def predict_proba(self, city: str, day_of_year: int) -> float:
+        return self.rates.get((city, int(day_of_year)), self.global_rate)
+
+    def predict_proba_df(self, df: pd.DataFrame) -> np.ndarray:
+        if "city" not in df.columns:
+            raise ValueError("df must contain 'city' column")
+        if "day_of_year" not in df.columns:
+            df = df.copy()
+            df["day_of_year"] = pd.to_datetime(df["date"]).dt.dayofyear
+        keys = list(zip(df["city"].values, df["day_of_year"].astype(int).values))
+        return np.array([self.rates.get(k, self.global_rate) for k in keys],
+                        dtype=float)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. Train daily model
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train_model(
     conn,
-    model_path:      str | Path = "models/latest.pkl",
-    training_table:  str        = "analytics.monthly_summary",
+    model_path:    str | Path = "models/daily_model.pkl",
+    feature_table: str        = "analytics.daily_enriched",
 ) -> dict:
     """
-    Train a classifier on analytics.monthly_summary → save to disk.
-
-    Returns a metrics dict:
-        {"rows_trained", "cities", "positive_rate", "city_rates",
-         "model_path", "model_type"}
+    Train DailyClassifier on the daily-enriched table → save to disk.
     """
-    logger.info("Training model on %s ...", training_table)
+    logger.info("Training daily model on %s ...", feature_table)
 
-    # Pull the monthly training data
     df = conn.execute(f"""
-        SELECT * FROM {training_table} ORDER BY city, year, month
+        SELECT * FROM {feature_table} ORDER BY city, date
     """).fetchdf()
 
-    if "high_risk_month" not in df.columns:
+    if "is_risk_day" not in df.columns:
         raise ValueError(
-            f"{training_table} is missing the 'high_risk_month' target column"
+            f"{feature_table} is missing the 'is_risk_day' target column. "
+            "Make sure the analytics layer is built before training."
         )
 
     if len(df) == 0:
-        raise ValueError(f"{training_table} is empty — cannot train")
+        raise ValueError(f"{feature_table} is empty — cannot train")
 
-    # Split features and target (we keep 'city' as a feature for the baseline)
-    y = df["high_risk_month"].astype(int)
-    X = df.drop(columns=["high_risk_month"])
+    if "month" not in df.columns:
+        df["month"] = pd.to_datetime(df["date"]).dt.month.astype(int)
 
-    # Fit
-    model = BaselinePredictor().fit(X, y)
+    y = df["is_risk_day"].astype(int)
+    X = df.drop(columns=["is_risk_day"])
 
-    # Persist
+    model = DailyClassifier().fit(X, y)
+
     model_path = Path(model_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     with model_path.open("wb") as f:
         pickle.dump(model, f)
-    logger.info("  Saved model → %s", model_path)
+    logger.info("  Saved daily model → %s", model_path)
 
-    metrics = {
-        "rows_trained":  int(model.trained_on_rows),
-        "cities":        len(model.city_rates),
-        "positive_rate": round(model.global_rate, 4),
-        "city_rates":    {k: round(v, 4) for k, v in model.city_rates.items()},
-        "model_path":    str(model_path),
-        "model_type":    "BaselinePredictor (Day-5 stub — replace in Day 6)",
+    return {
+        "rows_trained":   int(model.trained_on_rows),
+        "city_month_cells": len(model.rates),
+        "positive_rate":  round(model.global_rate, 4),
+        "model_path":     str(model_path),
+        "model_type":     "DailyClassifier (Day-5 baseline; Day 6 swaps to XGBoost)",
     }
-    return metrics
+
+
+def build_climatology(
+    conn,
+    climatology_path: str | Path = "models/climatology.pkl",
+    feature_table:    str        = "analytics.daily_enriched",
+    smoothing_window: int        = 7,
+) -> dict:
+    """
+    Build the climatology lookup table → save to disk.
+    """
+    logger.info("Building climatology from %s ...", feature_table)
+
+    df = conn.execute(f"""
+        SELECT city, date, is_risk_day
+        FROM {feature_table}
+        ORDER BY city, date
+    """).fetchdf()
+
+    if len(df) == 0:
+        raise ValueError(f"{feature_table} is empty — cannot build climatology")
+
+    table = ClimatologyTable(smoothing_window=smoothing_window).fit(df)
+
+    climatology_path = Path(climatology_path)
+    climatology_path.parent.mkdir(parents=True, exist_ok=True)
+    with climatology_path.open("wb") as f:
+        pickle.dump(table, f)
+    logger.info("  Saved climatology → %s", climatology_path)
+
+    return {
+        "entries":        len(table.rates),
+        "rows_used":      int(table.trained_on_rows),
+        "smoothing_days": smoothing_window,
+        "global_rate":    round(table.global_rate, 4),
+        "path":           str(climatology_path),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. Load
+# 4. Helpers — load + horizon planning
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_model(model_path: str | Path = "models/latest.pkl"):
+def load_model(path: str | Path):
     """Load a pickled model. Returns None if file missing."""
-    model_path = Path(model_path)
-    if not model_path.exists():
+    path = Path(path)
+    if not path.exists():
         return None
-    with model_path.open("rb") as f:
+    with path.open("rb") as f:
         return pickle.load(f)
 
 
+def _resolve_target_month(conn, target_month: Optional[str]) -> str:
+    """
+    Determine the target month: 'YYYY-MM' for the calendar month after the
+    latest month in analytics.monthly_summary.
+    """
+    if target_month is not None:
+        return target_month
+
+    try:
+        row = conn.execute("""
+            SELECT MAX(year) AS y,
+                   MAX(CASE WHEN year = (SELECT MAX(year) FROM analytics.monthly_summary)
+                            THEN month END) AS m
+            FROM analytics.monthly_summary
+        """).fetchone()
+        latest_year, latest_month = int(row[0]), int(row[1])
+    except Exception:
+        # No monthly data yet — predict for next month from today
+        today = date.today()
+        if today.month == 12:
+            return f"{today.year + 1}-01"
+        return f"{today.year}-{today.month + 1:02d}"
+
+    if latest_month == 12:
+        return f"{latest_year + 1}-01"
+    return f"{latest_year}-{latest_month + 1:02d}"
+
+
+def _all_dates_in_month(target_month: str) -> list[date]:
+    """Return list of all calendar dates in 'YYYY-MM'."""
+    y, m = map(int, target_month.split("-"))
+    n_days = monthrange(y, m)[1]
+    return [date(y, m, d) for d in range(1, n_days + 1)]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. Predict
+# 5. Predict — orchestrates short_horizon model + climatology
 # ══════════════════════════════════════════════════════════════════════════════
 
 def predict_next_month(
     conn,
-    model_path: str | Path  = "models/latest.pkl",
-    target_month: Optional[str] = None,
-    feature_table: str      = "analytics.monthly_summary",
-) -> pd.DataFrame:
+    model_path:        str | Path     = "models/daily_model.pkl",
+    climatology_path:  str | Path     = "models/climatology.pkl",
+    target_month:      Optional[str]  = None,
+    forecast_horizon:  Optional[int]  = None,
+    cities:            Optional[list[str]] = None,
+    threshold:         float          = 0.5,
+    n_monte_carlo:     int            = 5000,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Generate one prediction per city for `target_month`.
+    Generate per-day predictions for every (city × day) of the target month,
+    plus a derived monthly summary.
 
-    Since we don't have truly forward-looking features yet, we use the
-    most recent month's features as a proxy for "next month" — Day 6/8
-    will replace this with proper forecast-feature handling.
-
-    Parameters
-    ----------
-    target_month : 'YYYY-MM' string; defaults to the calendar month AFTER
-                   the latest month in `feature_table`.
+    Pipeline:
+      1. Resolve target_month and the list of dates to predict
+      2. Determine which dates fall in the short-horizon window (≤ N days
+         from today) vs the climatology window
+      3. For short-horizon dates: optionally fetch the Open-Meteo 7/16-day
+         forecast and use DailyClassifier on those features. If forecast
+         fetching fails, fall back to climatology with a warning.
+      4. For climatology dates: ClimatologyTable lookup
+      5. Compute monthly summary: Σ predictions, P(high_risk_month) via
+         Monte Carlo over per-day probabilities (Poisson-binomial estimate)
 
     Returns
     -------
-    pd.DataFrame with columns: city, target_month, probability, prediction
+    daily_df : DataFrame with columns
+        city, date, day_of_month, probability, prediction, source
+    monthly_df : DataFrame with columns
+        city, target_month, risk_days_predicted,
+        high_risk_month_probability, n_short_horizon_days, n_climatology_days
     """
+    # Lazy imports
+    try:
+        from src.config import (
+            CITIES,
+            FORECAST_HORIZON_DAYS,
+            HIGH_RISK_MONTH_THRESHOLD,
+            FORECAST_VARIABLES,
+        )
+    except ImportError:
+        CITIES = {}
+        FORECAST_HORIZON_DAYS = 16
+        HIGH_RISK_MONTH_THRESHOLD = 5
+        FORECAST_VARIABLES = []
+
+    forecast_horizon = forecast_horizon if forecast_horizon is not None else FORECAST_HORIZON_DAYS
+    cities = cities or list(CITIES.keys())
+    if not cities:
+        raise ValueError("No cities to predict for")
+
+    # Load both models
     model = load_model(model_path)
     if model is None:
         raise FileNotFoundError(
             f"No model at {model_path} — run train_model() first"
         )
-
-    # Pull each city's most recent month as the feature row
-    latest = conn.execute(f"""
-        WITH ranked AS (
-            SELECT *,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY city ORDER BY year DESC, month DESC
-                   ) AS rn
-            FROM {feature_table}
+    clim = load_model(climatology_path)
+    if clim is None:
+        raise FileNotFoundError(
+            f"No climatology at {climatology_path} — run build_climatology() first"
         )
-        SELECT * FROM ranked WHERE rn = 1
-    """).fetchdf()
-    if "rn" in latest.columns:
-        latest = latest.drop(columns=["rn"])
 
-    if len(latest) == 0:
-        raise ValueError(f"{feature_table} is empty — cannot predict")
+    # Plan the horizon
+    target_month = _resolve_target_month(conn, target_month)
+    target_dates = _all_dates_in_month(target_month)
+    today = date.today()
+    short_horizon_end = today + timedelta(days=forecast_horizon)
 
-    # Determine target month
-    if target_month is None:
-        latest_year  = int(latest["year"].max())
-        latest_month = int(latest[latest["year"] == latest_year]["month"].max())
-        # Add 1 month (rolling over December)
-        if latest_month == 12:
-            tgt_year, tgt_month = latest_year + 1, 1
-        else:
-            tgt_year, tgt_month = latest_year, latest_month + 1
-        target_month = f"{tgt_year:04d}-{tgt_month:02d}"
+    # Try to fetch short-horizon forecast features (best-effort)
+    forecast_df = _try_fetch_forecast(
+        cities, CITIES, today, short_horizon_end, FORECAST_VARIABLES,
+    )
 
-    # Predict
-    proba = model.predict_proba(latest)[:, 1]
-    pred  = (proba >= 0.5).astype(int)
+    # Build the full prediction DataFrame
+    rows = []
+    for city in cities:
+        for d in target_dates:
+            day_of_year = d.timetuple().tm_yday
 
-    out = pd.DataFrame({
-        "city":         latest["city"].values,
-        "target_month": target_month,
-        "probability":  np.round(proba, 4),
-        "prediction":   pred,
-    }).sort_values("city").reset_index(drop=True)
+            # Decide source
+            use_short_horizon = (
+                forecast_df is not None
+                and today <= d <= short_horizon_end
+            )
+
+            if use_short_horizon:
+                # Try to find features for this (city, date) in the forecast df
+                fc_row = forecast_df[
+                    (forecast_df["city"] == city)
+                    & (pd.to_datetime(forecast_df["date"]).dt.date == d)
+                ]
+                if len(fc_row) == 0:
+                    # Forecast didn't cover this day — fall back
+                    p = clim.predict_proba(city, day_of_year)
+                    src = "climatology"
+                else:
+                    fc_row = fc_row.copy()
+                    if "month" not in fc_row.columns:
+                        fc_row["month"] = d.month
+                    p = float(model.predict_proba(fc_row)[:, 1][0])
+                    src = "short_horizon"
+            else:
+                p = clim.predict_proba(city, day_of_year)
+                src = "climatology"
+
+            rows.append({
+                "city":         city,
+                "date":         d.isoformat(),
+                "day_of_month": d.day,
+                "probability":  round(p, 4),
+                "prediction":   int(p >= threshold),
+                "source":       src,
+            })
+
+    daily_df = pd.DataFrame(rows).sort_values(["city", "date"]).reset_index(drop=True)
+
+    # Monthly summary
+    monthly_df = _summarise_monthly(
+        daily_df, target_month, threshold, n_monte_carlo, HIGH_RISK_MONTH_THRESHOLD,
+    )
 
     logger.info(
-        "  Generated predictions for %s across %d cities",
-        target_month, len(out),
+        "  %d daily predictions for %s across %d cities "
+        "(short_horizon=%d, climatology=%d)",
+        len(daily_df), target_month, len(cities),
+        int((daily_df["source"] == "short_horizon").sum()),
+        int((daily_df["source"] == "climatology").sum()),
     )
-    return out
+
+    return daily_df, monthly_df
+
+
+# ── Helpers used inside predict_next_month ───────────────────────────────────
+
+def _try_fetch_forecast(
+    cities:         list[str],
+    cities_meta:    dict,
+    start_date:     date,
+    end_date:       date,
+    variables:      list[str],
+) -> Optional[pd.DataFrame]:
+    """
+    Attempt to fetch the Open-Meteo forecast for each city.
+    Returns a combined DataFrame, or None if any fetch fails (in which case
+    the caller falls back to climatology for the entire window).
+    """
+    try:
+        from src.ingestion import fetch_forecast
+    except ImportError:
+        logger.warning(
+            "  src.ingestion.fetch_forecast not importable — "
+            "all dates will use climatology"
+        )
+        return None
+
+    if not cities_meta:
+        logger.warning("  No CITIES metadata — skipping forecast fetch")
+        return None
+
+    n_days = (end_date - start_date).days + 1
+    pieces = []
+    for city in cities:
+        meta = cities_meta.get(city)
+        if not meta:
+            logger.warning("  No metadata for %s — skipping", city)
+            continue
+        try:
+            df = fetch_forecast(
+                city=city,
+                lat=meta["lat"],
+                lon=meta["lon"],
+                variables=variables,
+                forecast_days=min(n_days, 16),
+                timezone=meta.get("timezone", "auto"),
+            )
+            if df is not None and not df.empty:
+                pieces.append(df)
+                logger.info("  Forecast fetched for %s (%d days)", city, len(df))
+        except Exception as exc:
+            logger.warning("  Forecast fetch FAILED for %s: %s", city, exc)
+            return None   # one failure → climatology for everyone
+
+    if not pieces:
+        return None
+    combined = pd.concat(pieces, ignore_index=True)
+    return combined
+
+
+def _summarise_monthly(
+    daily_df:                  pd.DataFrame,
+    target_month:              str,
+    threshold:                 float,
+    n_monte_carlo:             int,
+    high_risk_month_threshold: int,
+) -> pd.DataFrame:
+    """
+    Per-city monthly summary derived from daily predictions.
+
+    risk_days_predicted          = count of days where prediction == 1
+    high_risk_month_probability  = P(sum of bernoulli(p_i) ≥ threshold)
+                                   estimated by Monte Carlo over the
+                                   per-day probabilities (Poisson-binomial)
+    """
+    rng = np.random.default_rng(seed=42)
+    rows = []
+    for city, sub in daily_df.groupby("city"):
+        probs = sub["probability"].values
+        risk_days_pred = int(sub["prediction"].sum())
+
+        # Monte-Carlo: P(Σ Bernoulli(p_i) ≥ threshold)
+        samples = rng.binomial(1, probs[None, :], size=(n_monte_carlo, len(probs)))
+        sums = samples.sum(axis=1)
+        p_high_risk = float((sums >= high_risk_month_threshold).mean())
+
+        n_short = int((sub["source"] == "short_horizon").sum())
+        n_clim  = int((sub["source"] == "climatology").sum())
+
+        rows.append({
+            "city":                         city,
+            "target_month":                 target_month,
+            "risk_days_predicted":          risk_days_pred,
+            "high_risk_month_probability":  round(p_high_risk, 4),
+            "n_short_horizon_days":         n_short,
+            "n_climatology_days":           n_clim,
+        })
+    return pd.DataFrame(rows).sort_values("city").reset_index(drop=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5. Save predictions to CSV (convenience)
+# 6. Save predictions
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_predictions(preds: pd.DataFrame, out_dir: str | Path = "predictions") -> Path:
+def save_predictions(
+    daily_df:     pd.DataFrame,
+    monthly_df:   pd.DataFrame,
+    target_month: Optional[str]   = None,
+    out_dir:      str | Path      = "predictions",
+) -> tuple[Path, Path]:
     """
-    Save predictions to `<out_dir>/YYYY-MM.csv`.
-    Returns the written path.
+    Write predictions to:
+        <out_dir>/<target_month>/daily.csv
+        <out_dir>/<target_month>/monthly.csv
+
+    Returns (daily_path, monthly_path).
     """
-    target_month = preds["target_month"].iloc[0]
-    out_dir = Path(out_dir)
+    if target_month is None:
+        if "target_month" in monthly_df.columns and len(monthly_df) > 0:
+            target_month = str(monthly_df["target_month"].iloc[0])
+        else:
+            raise ValueError("target_month not provided and not derivable")
+
+    out_dir = Path(out_dir) / target_month
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{target_month}.csv"
-    preds.to_csv(out_path, index=False)
-    logger.info("  Saved predictions → %s", out_path)
-    return out_path
+
+    daily_path   = out_dir / "daily.csv"
+    monthly_path = out_dir / "monthly.csv"
+    daily_df.to_csv(daily_path,   index=False)
+    monthly_df.to_csv(monthly_path, index=False)
+
+    logger.info("  Saved daily predictions   → %s", daily_path)
+    logger.info("  Saved monthly summary     → %s", monthly_path)
+    return daily_path, monthly_path
