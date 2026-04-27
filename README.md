@@ -340,26 +340,7 @@ team name: Anemoi
 - **Interaction:** Act as the glue, taking the pipeline from the Data Engineer and the model from the ML Engineer to create the final working product.
 
 
-
-## 11. Daily Activities
-
-A typical working day in this sprint follows this rhythm:
-
-| Time | Activity |
-|------|----------|
-| Morning | Review previous day's deliverables; check `meta.pipeline_runs` for any failed scheduled runs; read the day's spec |
-| Mid-morning | Design / sketch the day's main modules; sanity-check assumptions with quick exploratory cells |
-| Afternoon | Implement modules in `src/`; write the day's notebook; run unit-style sanity checks |
-| Late afternoon | Run quality gates end-to-end; fix any newly surfaced issues; commit changes |
-| End of day | Update README incrementals; tag the day's PR; push to GitHub |
-
-For maintenance after the sprint:
-
-- **Monthly (automatic via GitHub Actions)**: pipeline fetches new days, retrains, generates predictions, commits CSVs back to the repo
-- **Quarterly (manual, ~5 minutes)**: run `python src/pipeline.py --mode full` to refresh historical revisions Open-Meteo may have made
-- **As needed**: review `meta.quality_flags` for any new value-range outliers; investigate and adjust thresholds if a real climate change shows up
-
-## 12. Repository Structure
+## 11. Repository Structure
 
 ```
 caspian-maritime-weather/
@@ -402,7 +383,7 @@ caspian-maritime-weather/
     └── pipeline.log         ← rotating, last 30 runs
 ```
 
-## 13. Quick Start
+## 12. Quick Start
 
 ```bash
 git clone https://github.com/<your-username>/caspian-maritime-weather.git
@@ -426,7 +407,7 @@ To enable automatic monthly runs:
 4. Trigger once manually from the **Actions** tab to verify
 5. Cron takes over from there
 
-## 14. Limitations & Honest Assessment
+## 13. Limitations & Honest Assessment
 
 1. **Wave height is a wind-derived proxy**, not a measurement. Accuracy is ±30% vs ERA5 reanalysis. If the model ends up heavily wave-driven, this uncertainty propagates into the risk probability.
 2. **Labels are threshold-based, not observational**. The model predicts "weather thresholds will be breached on ≥5 days," not "actual port disruptions will occur." Without AIS or port-log ground truth, this is the closest proxy available.
