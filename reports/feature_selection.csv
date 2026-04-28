@@ -1,0 +1,26 @@
+feature,decision,corr_with_target,reason
+cdd,DROP,0.096,|r|=0.87 with apparent_temperature_mean; weaker target signal (|r_target|=0.10 vs 0.17)
+dew_point_2m_mean,DROP,0.104,|r|=0.95 with apparent_temperature_mean; weaker target signal (|r_target|=0.10 vs 0.17)
+doy_cos,DROP,0.053,|r|=0.89 with shortwave_radiation_sum; weaker target signal (|r_target|=0.05 vs 0.13)
+doy_sin,DROP,0.014,|r|=0.95 with month_sin; weaker target signal (|r_target|=0.01 vs 0.03)
+hdd,DROP,0.109,|r|=0.93 with apparent_temperature_mean; weaker target signal (|r_target|=0.11 vs 0.17)
+month_cos,DROP,0.048,|r|=0.95 with doy_cos; weaker target signal (|r_target|=0.05 vs 0.05)
+rain_sum,DROP,0.263,|r|=0.96 with precipitation_sum; weaker target signal (|r_target|=0.26 vs 0.29)
+temperature_2m_max,DROP,0.146,|r|=0.98 with apparent_temperature_mean; weaker target signal (|r_target|=0.15 vs 0.17)
+temperature_2m_mean,DROP,0.114,|r|=0.99 with apparent_temperature_mean; weaker target signal (|r_target|=0.11 vs 0.17)
+temperature_2m_min,DROP,0.078,|r|=0.97 with apparent_temperature_mean; weaker target signal (|r_target|=0.08 vs 0.17)
+wind_gusts_10m_max,DROP,0.596,|r|=0.86 with wave_height; weaker target signal (|r_target|=0.60 vs 0.70)
+wind_speed_10m_max,DROP,0.611,|r|=0.92 with wave_height; weaker target signal (|r_target|=0.61 vs 0.70)
+apparent_temperature_mean,KEEP,0.17,
+month_sin,KEEP,0.03,
+precipitation_sum,KEEP,0.29,
+relative_humidity_2m_mean,KEEP,0.051,
+shortwave_radiation_sum,KEEP,0.129,
+snowfall_sum,KEEP,0.16,
+surface_pressure_mean,KEEP,0.003,
+temp_range_c,KEEP,0.225,
+visibility_hours_below_1km,KEEP,0.167,
+visibility_mean,KEEP,0.051,
+visibility_min,KEEP,0.128,
+wave_height,KEEP,0.701,
+is_risk_day,TARGET,1.0,"this is the prediction target, not a feature"
