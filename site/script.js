@@ -74,20 +74,31 @@
   }
 
   // ─── Discover the latest available month ──────────────────────────
-  // We try the current YYYY-MM first; if it fails, walk back month-by-month.
+  // Forecasts cover the upcoming month. Try +1 month first (the forecast
+  // for the month ahead), then current month, then walk back up to 6 months.
   // This works because Vercel returns 404 for missing files.
   async function findLatestMonth() {
     const now = new Date();
+    const probe = [];
+    // +1 first (the upcoming month, which the cron is expected to publish on the 1st)
     let y = now.getUTCFullYear();
-    let m = now.getUTCMonth() + 1;
+    let m = now.getUTCMonth() + 2;  // +1 from getUTCMonth which is 0-indexed, +1 again for next month
+    if (m > 12) { m -= 12; y += 1; }
+    probe.push([y, m]);
+    // Then current month, walking back
+    y = now.getUTCFullYear();
+    m = now.getUTCMonth() + 1;
     for (let i = 0; i < 6; i++) {
-      const ym = `${y}-${String(m).padStart(2, '0')}`;
+      probe.push([y, m]);
+      m -= 1;
+      if (m === 0) { m = 12; y -= 1; }
+    }
+    for (const [yy, mm] of probe) {
+      const ym = `${yy}-${String(mm).padStart(2, '0')}`;
       try {
         const r = await fetch(`predictions/${ym}/daily.csv`, { method: 'HEAD' });
         if (r.ok) return ym;
-      } catch (e) { /* CORS or network — ignore and continue */ }
-      m -= 1;
-      if (m === 0) { m = 12; y -= 1; }
+      } catch (e) { /* network error — skip and continue */ }
     }
     return null;
   }
@@ -215,16 +226,24 @@
     const list = document.getElementById('archive-list');
     const found = [];
     const now = new Date();
+    // Check upcoming month, current, and 24 past months
     let y = now.getUTCFullYear();
-    let m = now.getUTCMonth() + 1;
+    let m = now.getUTCMonth() + 2;  // upcoming month
+    if (m > 12) { m -= 12; y += 1; }
+    const probes = [[y, m]];
+    y = now.getUTCFullYear();
+    m = now.getUTCMonth() + 1;
     for (let i = 0; i < 24; i++) {
-      const ym = `${y}-${String(m).padStart(2, '0')}`;
+      probes.push([y, m]);
+      m -= 1;
+      if (m === 0) { m = 12; y -= 1; }
+    }
+    for (const [yy, mm] of probes) {
+      const ym = `${yy}-${String(mm).padStart(2, '0')}`;
       try {
         const r = await fetch(`predictions/${ym}/monthly.csv`, { method: 'HEAD' });
         if (r.ok) found.push(ym);
       } catch (e) { /* skip */ }
-      m -= 1;
-      if (m === 0) { m = 12; y -= 1; }
     }
     if (found.length === 0) {
       list.appendChild(el('li', { className: 'notice' },
