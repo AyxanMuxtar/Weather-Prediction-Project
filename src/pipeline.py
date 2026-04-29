@@ -50,7 +50,11 @@ from src.config import (
     CITIES, ALL_VARIABLES, DATE_RANGE, PATHS, API,
 )
 from src.ingestion import (
-    fetch_historical, fetch_all_cities, save_raw,
+    fetch_historical,
+    fetch_all_cities,
+    fetch_historical_forecast_hourly,
+    aggregate_hourly_visibility,
+    save_raw,
 )
 from src.database import (
     get_connection, create_schemas, create_raw_tables,
@@ -242,25 +246,95 @@ def stage_ingest(conn, start: str, end: str, data_dir: Path,
     if dry_run:
         log.info("  [dry-run] would fetch %d cities × %d vars for %s to %s",
                  len(CITIES), len(ALL_VARIABLES), start, end)
-        return {"rows_fetched": 0, "files_written": 0}
+        log.info("  [dry-run] would also fetch hourly visibility from 2022 onwards")
+        return {
+            "rows_fetched": 0,
+            "visibility_rows_fetched": 0,
+            "files_written": 0,
+        }
 
+    # 1) Fetch daily historical weather
     dfs = fetch_all_cities(
-        cities=CITIES, start=start, end=end, variables=ALL_VARIABLES,
+        cities=CITIES,
+        start=start,
+        end=end,
+        variables=ALL_VARIABLES,
         delay_between_cities=2.0,
     )
 
-    rows_total, files = 0, 0
+    rows_total = 0
+    files = 0
+
     for city, df in dfs.items():
         if df is None or df.empty:
-            log.warning("  %s: 0 rows returned", city)
+            log.warning("  %s: 0 weather rows returned", city)
             continue
+
         fname = f"{city.lower()}_historical_{start[:4]}_{end[:4]}"
         save_raw(df, fname, directory=data_dir)
+
         rows_total += len(df)
         files += 1
 
-    log.info("  Fetched %d rows across %d files", rows_total, files)
-    return {"rows_fetched": rows_total, "files_written": files}
+    # 2) Fetch hourly visibility separately
+    visibility_start = max(pd.Timestamp(start), pd.Timestamp("2022-01-01"))
+    visibility_end = pd.Timestamp(end)
+
+    visibility_rows_total = 0
+
+    if visibility_start <= visibility_end:
+        vis_start_s = visibility_start.strftime("%Y-%m-%d")
+        vis_end_s = visibility_end.strftime("%Y-%m-%d")
+
+        for city, meta in CITIES.items():
+            try:
+                log.info(
+                    "  Fetching hourly visibility %-15s %s → %s",
+                    city, vis_start_s, vis_end_s
+                )
+
+                hourly_vis = fetch_historical_forecast_hourly(
+                    city=city,
+                    lat=meta["lat"],
+                    lon=meta["lon"],
+                    start=vis_start_s,
+                    end=vis_end_s,
+                    variables=["visibility"],
+                    timezone=meta.get("timezone", "auto"),
+                )
+
+                if hourly_vis is None or hourly_vis.empty:
+                    log.warning("  %s: 0 visibility rows returned", city)
+                    continue
+
+                daily_vis = aggregate_hourly_visibility(hourly_vis)
+
+                fname = f"{city.lower()}_hourly_visibility_{vis_start_s[:4]}_{vis_end_s[:4]}"
+                save_raw(daily_vis, fname, directory=data_dir)
+
+                visibility_rows_total += len(daily_vis)
+                files += 1
+
+                time.sleep(2.0)
+
+            except Exception as exc:
+                log.warning("  Visibility fetch failed for %s: %s", city, exc)
+
+    else:
+        log.info("  Skipping visibility fetch: requested window is before 2022")
+
+    log.info(
+        "  Fetched %d weather rows + %d daily visibility rows across %d files",
+        rows_total,
+        visibility_rows_total,
+        files,
+    )
+
+    return {
+        "rows_fetched": rows_total,
+        "visibility_rows_fetched": visibility_rows_total,
+        "files_written": files,
+    }
 
 
 def stage_load_raw(conn, data_dir: Path, incremental: bool = False,

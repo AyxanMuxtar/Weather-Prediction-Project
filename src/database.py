@@ -245,23 +245,67 @@ def load_raw_data(
         count = conn.execute("SELECT COUNT(*) FROM raw.weather_daily").fetchone()[0]
         loaded["raw.weather_daily"] = count
 
-    # ── Hourly visibility CSVs (aggregate to daily, then load) ────────────────
+    # ── Visibility CSVs ────────────────────────────────────────────────────────
     vis_hourly_files = sorted(data_dir.glob("*_hourly_visibility_*.csv"))
+
     if vis_hourly_files:
         for f in vis_hourly_files:
-            conn.execute(f"""
-                INSERT OR IGNORE INTO raw.visibility_daily
-                SELECT
-                    city,
-                    CAST(datetime AS DATE) AS date,
-                    AVG(visibility)        AS visibility_mean,
-                    MIN(visibility)        AS visibility_min,
-                    SUM(CASE WHEN visibility < 1000 THEN 1 ELSE 0 END)
-                                           AS visibility_hours_below_1km
-                FROM read_csv_auto('{f}', header=true)
-                GROUP BY city, CAST(datetime AS DATE)
-            """)
-            logger.info("  Loaded %s → raw.visibility_daily (hourly aggregated)", f.name)
+            df_sample = pd.read_csv(f, nrows=0)
+            cols = set(df_sample.columns)
+
+            # Case 1: already daily-aggregated visibility file
+            if {
+                "city",
+                "date",
+                "visibility_mean",
+                "visibility_min",
+                "visibility_hours_below_1km",
+            }.issubset(cols):
+
+                conn.execute(f"""
+                    INSERT OR REPLACE INTO raw.visibility_daily (
+                        city,
+                        date,
+                        visibility_mean,
+                        visibility_min,
+                        visibility_hours_below_1km
+                    )
+                    SELECT
+                        city,
+                        CAST(date AS DATE) AS date,
+                        visibility_mean,
+                        visibility_min,
+                        visibility_hours_below_1km
+                    FROM read_csv_auto('{f}', header=true, dateformat='%Y-%m-%d')
+                """)
+
+                logger.info("  Loaded %s → raw.visibility_daily (daily visibility)", f.name)
+
+            # Case 2: true hourly visibility file
+            elif "datetime" in cols and "visibility" in cols:
+
+                conn.execute(f"""
+                    INSERT OR REPLACE INTO raw.visibility_daily
+                    SELECT
+                        city,
+                        CAST(datetime AS DATE) AS date,
+                        AVG(visibility) AS visibility_mean,
+                        MIN(visibility) AS visibility_min,
+                        SUM(CASE WHEN visibility < 1000 THEN 1 ELSE 0 END)
+                            AS visibility_hours_below_1km
+                    FROM read_csv_auto('{f}', header=true)
+                    WHERE visibility IS NOT NULL
+                    GROUP BY city, CAST(datetime AS DATE)
+                """)
+
+                logger.info("  Loaded %s → raw.visibility_daily (hourly aggregated)", f.name)
+
+            else:
+                logger.warning(
+                    "  Skipping %s: unsupported visibility columns: %s",
+                    f.name,
+                    sorted(cols),
+                )
 
         count = conn.execute("SELECT COUNT(*) FROM raw.visibility_daily").fetchone()[0]
         loaded["raw.visibility_daily"] = count
