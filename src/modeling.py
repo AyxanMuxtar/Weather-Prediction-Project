@@ -52,218 +52,6 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 1. DailyClassifier — placeholder for Day 6's real model
-# ══════════════════════════════════════════════════════════════════════════════
-
-class DailyClassifier:
-    """
-    Predict P(is_risk_day = 1) given daily weather features.
-
-    Day 8 implementation: XGBoost gradient-boosted trees, with sklearn's
-    GradientBoostingClassifier and a per-(city, month) baseline as
-    fallbacks. The model is selected at fit() time based on what's
-    available; .fit() / .predict_proba() interface is identical to
-    the Day-5 stub so src/pipeline.py needs no changes.
-
-    Required input columns
-    ----------------------
-    X must contain at minimum:
-        - city
-    Plus the SELECTED_FEATURES list from reports/selected_features.py if
-    available — otherwise the model uses whatever numeric columns it finds.
-
-    Selection priority for the underlying classifier
-    ------------------------------------------------
-    1. xgboost.XGBClassifier  (if installed)        — preferred
-    2. sklearn.ensemble.GradientBoostingClassifier  — solid fallback
-    3. Per-(city, month) baseline                   — last resort
-    """
-
-    def __init__(
-        self,
-        prefer: str = "auto",            # 'xgboost' | 'sklearn' | 'baseline' | 'auto'
-        random_state: int = 42,
-        scale_pos_weight: Optional[float] = None,
-    ):
-        self.prefer = prefer
-        self.random_state = random_state
-        self.scale_pos_weight = scale_pos_weight
-
-        # State filled at fit time
-        self._impl = None
-        self._impl_name = "untrained"
-        self._feature_cols: list[str] = []
-        self._city_cols: list[str] = []
-        self._impute_medians: dict = {}
-        self._baseline_rates: dict = {}
-        self._global_rate: float = 0.5
-        self.trained_on_rows: int = 0
-        self.feature_importances_: dict = {}
-
-    def _select_features(self, X: pd.DataFrame) -> list[str]:
-        """Pick the feature columns to feed the underlying model."""
-        try:
-            import sys
-            repo = Path(__file__).resolve().parent.parent
-            if str(repo) not in sys.path:
-                sys.path.insert(0, str(repo))
-            from reports.selected_features import SELECTED_FEATURES  # type: ignore
-            chosen = [c for c in SELECTED_FEATURES if c in X.columns]
-            if chosen:
-                logger.info("  Using %d Day-7-selected features", len(chosen))
-                return chosen
-        except Exception:
-            pass
-
-        numeric = X.select_dtypes(include=[np.number]).columns.tolist()
-        excluded = {"is_risk_day", "year", "day_of_year", "week_of_year",
-                    "day_of_week", "quarter"}
-        return [c for c in numeric
-                if c not in excluded and not c.endswith("_is_outlier")]
-
-    def _build_design_matrix(
-        self, X: pd.DataFrame, *, fit_phase: bool,
-    ) -> np.ndarray:
-        if fit_phase:
-            self._feature_cols = self._select_features(X)
-            if "city" in X.columns:
-                self._city_cols = sorted(
-                    f"city_{c}" for c in X["city"].dropna().unique()
-                )
-            else:
-                self._city_cols = []
-
-        feat = (X[self._feature_cols].copy() if self._feature_cols
-                else pd.DataFrame(index=X.index))
-
-        if self._city_cols and "city" in X.columns:
-            dummies = pd.get_dummies(X["city"], prefix="city")
-            for c in self._city_cols:
-                if c not in dummies.columns:
-                    dummies[c] = 0
-            dummies = dummies[self._city_cols].astype(int)
-            feat = pd.concat([feat.reset_index(drop=True),
-                              dummies.reset_index(drop=True)], axis=1)
-
-        if fit_phase:
-            self._impute_medians = feat.median(numeric_only=True).to_dict()
-        feat = feat.fillna(self._impute_medians)
-
-        return feat.values.astype(float)
-
-    def _pick_implementation(self):
-        if self.prefer == "baseline":
-            return None, "baseline"
-
-        if self.prefer in ("auto", "xgboost"):
-            try:
-                from xgboost import XGBClassifier
-                return XGBClassifier(
-                    n_estimators=300, max_depth=5, learning_rate=0.05,
-                    subsample=0.9, colsample_bytree=0.9,
-                    scale_pos_weight=self.scale_pos_weight or 1.0,
-                    random_state=self.random_state,
-                    eval_metric="logloss", verbosity=0, n_jobs=-1,
-                ), "xgboost"
-            except ImportError:
-                if self.prefer == "xgboost":
-                    raise
-
-        if self.prefer in ("auto", "sklearn"):
-            from sklearn.ensemble import GradientBoostingClassifier
-            return GradientBoostingClassifier(
-                n_estimators=300, max_depth=4, learning_rate=0.05,
-                subsample=0.9, random_state=self.random_state,
-            ), "sklearn_gbm"
-
-        return None, "baseline"
-
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> "DailyClassifier":
-        if "city" not in X.columns:
-            raise ValueError("X must contain a 'city' column")
-
-        y_arr = np.asarray(y).astype(int)
-        self._global_rate = float(y_arr.mean())
-        self.trained_on_rows = len(y_arr)
-
-        impl, impl_name = self._pick_implementation()
-        self._impl_name = impl_name
-
-        if impl is None:
-            X_local = X.copy()
-            if "month" not in X_local.columns:
-                X_local["month"] = pd.to_datetime(X_local.get("date", pd.NaT)).dt.month
-            df_b = X_local[["city", "month"]].copy()
-            df_b["_y"] = y_arr
-            self._baseline_rates = (
-                df_b.groupby(["city", "month"])["_y"].mean().to_dict()
-            )
-            logger.info(
-                "  DailyClassifier[baseline] fit on %d rows, %d (city,month) cells",
-                self.trained_on_rows, len(self._baseline_rates),
-            )
-            return self
-
-        if (impl_name == "xgboost"
-                and self.scale_pos_weight is None
-                and y_arr.sum() > 0):
-            n_pos = int(y_arr.sum())
-            n_neg = int(len(y_arr) - n_pos)
-            try:
-                impl.set_params(scale_pos_weight=n_neg / max(n_pos, 1))
-            except Exception:
-                pass
-
-        X_mat = self._build_design_matrix(X, fit_phase=True)
-        impl.fit(X_mat, y_arr)
-        self._impl = impl
-
-        try:
-            cols = list(self._feature_cols) + list(self._city_cols)
-            importances = getattr(impl, "feature_importances_", None)
-            if importances is not None:
-                self.feature_importances_ = dict(zip(cols, importances.tolist()))
-        except Exception:
-            pass
-
-        logger.info(
-            "  DailyClassifier[%s] fit on %d rows; %d features (%d weather + %d city dummies); "
-            "positive rate = %.3f",
-            impl_name, self.trained_on_rows,
-            len(self._feature_cols) + len(self._city_cols),
-            len(self._feature_cols), len(self._city_cols), self._global_rate,
-        )
-        return self
-
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        if self._impl is None and not self._baseline_rates:
-            raise RuntimeError("Model is not fitted; call .fit() first")
-
-        if self._impl is None:
-            X_local = X.copy()
-            if "month" not in X_local.columns:
-                X_local["month"] = pd.to_datetime(X_local.get("date", pd.NaT)).dt.month
-            keys = list(zip(X_local["city"].values,
-                            X_local["month"].astype(int).values))
-            probs = np.array(
-                [self._baseline_rates.get(k, self._global_rate) for k in keys],
-                dtype=float,
-            )
-            return np.column_stack([1 - probs, probs])
-
-        X_mat = self._build_design_matrix(X, fit_phase=False)
-        proba = self._impl.predict_proba(X_mat)
-        if proba.ndim == 1:
-            proba = np.column_stack([1 - proba, proba])
-        return proba
-
-    def predict(self, X: pd.DataFrame, threshold: float = 0.5) -> np.ndarray:
-        return (self.predict_proba(X)[:, 1] >= threshold).astype(int)
-
-    @property
-    def model_type(self) -> str:
-        return self._impl_name
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -374,48 +162,218 @@ class ClimatologyTable:
 
 def train_model(
     conn,
-    model_path:    str | Path = "models/daily_model.pkl",
-    feature_table: str        = "analytics.daily_enriched",
+    model_path: str | Path = "models/daily_model.pkl",
+    feature_table: str = "analytics.daily_enriched",
+    decision_threshold: float = 0.10,
 ) -> dict:
     """
-    Train DailyClassifier on the daily-enriched table → save to disk.
+    Train the production next-day maritime delay-risk model.
+
+    Production target:
+        features at day t -> target_risk_next_day = is_risk_day at day t+1
+
+    This replaces the old DailyClassifier baseline. The saved object is a
+    bundle containing:
+        - calibrated sklearn model
+        - feature column list
+        - target name
+        - decision threshold
+        - metadata for the app/pipeline
     """
-    logger.info("Training daily model on %s ...", feature_table)
+    logger.info("Training calibrated next-day model on %s ...", feature_table)
+
+    from sklearn.pipeline import Pipeline
+    from sklearn.compose import ColumnTransformer
+    from sklearn.preprocessing import StandardScaler, OneHotEncoder
+    from sklearn.impute import SimpleImputer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.calibration import CalibratedClassifierCV
 
     df = conn.execute(f"""
-        SELECT * FROM {feature_table} ORDER BY city, date
+        SELECT *
+        FROM {feature_table}
+        ORDER BY city, date
     """).fetchdf()
-
-    if "is_risk_day" not in df.columns:
-        raise ValueError(
-            f"{feature_table} is missing the 'is_risk_day' target column. "
-            "Make sure the analytics layer is built before training."
-        )
 
     if len(df) == 0:
         raise ValueError(f"{feature_table} is empty — cannot train")
 
-    if "month" not in df.columns:
-        df["month"] = pd.to_datetime(df["date"]).dt.month.astype(int)
+    if "is_risk_day" not in df.columns:
+        raise ValueError(
+            f"{feature_table} is missing 'is_risk_day'. "
+            "Build analytics layer before training."
+        )
 
-    y = df["is_risk_day"].astype(int)
-    X = df.drop(columns=["is_risk_day"])
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values(["city", "date"]).reset_index(drop=True)
 
-    model = DailyClassifier().fit(X, y)
+    # Next-day target: today's features predict tomorrow's risk
+    target = "target_risk_next_day"
+    df[target] = df.groupby("city")["is_risk_day"].shift(-1)
+
+    df_model = df.dropna(subset=[target]).copy()
+    df_model[target] = df_model[target].astype(int)
+
+    # These must never be used as model inputs
+    leakage_cols = {
+    # targets / labels
+    "is_risk_day",
+    "target_risk_next_day",
+    "high_risk_month",
+    "risk_days",
+    "risk_day_pct",
+
+    # direct same-day threshold variables used to define risk
+    "wind_speed_10m_max",
+    "wind_gusts_10m_max",
+    "precipitation_sum",
+    "rain_sum",
+    "snowfall_sum",
+    "visibility_mean",
+    "visibility_min",
+    "visibility_hours_below_1km",
+    "wave_height",
+
+    # direct risk flags
+    "risk_wind",
+    "risk_gust",
+    "risk_precip",
+    "risk_snow",
+    "risk_wave",
+    "risk_visibility",
+    "risk_fog_min",
+    "risk_fog_proxy",
+}
+
+    # Use Day-7 selected features as source of truth
+    try:
+        from reports.selected_features import SELECTED_FEATURES
+
+        feature_cols = [
+            c for c in SELECTED_FEATURES
+            if c in df_model.columns and c not in leakage_cols
+        ]
+
+        logger.info("  Using %d Day-7 selected leakage-safe features", len(feature_cols))
+
+    except Exception as exc:
+        logger.warning(
+            "Could not load reports.selected_features.SELECTED_FEATURES: %s",
+            exc,
+        )
+        logger.warning("Falling back to all leakage-safe non-target columns.")
+
+        excluded = leakage_cols | {"date"}
+        feature_cols = [
+            c for c in df_model.columns
+            if c not in excluded
+        ]
+
+    if not feature_cols:
+        raise ValueError("No usable feature columns found for training")
+
+    X = df_model[feature_cols].copy()
+    y = df_model[target].astype(int).values
+
+    categorical_features = [
+        c for c in ["city", "season"]
+        if c in feature_cols
+    ]
+
+    numeric_features = [
+        c for c in feature_cols
+        if c not in categorical_features
+    ]
+
+    numeric_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
+
+    categorical_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(drop="first", handle_unknown="ignore")),
+    ])
+
+    preprocess = ColumnTransformer(
+        transformers=[
+            ("num", numeric_transformer, numeric_features),
+            ("cat", categorical_transformer, categorical_features),
+        ],
+        remainder="drop",
+    )
+
+    base_model = LogisticRegression(
+        class_weight="balanced",
+        max_iter=1000,
+        random_state=42,
+        solver="lbfgs",
+    )
+
+    base_pipeline = Pipeline(steps=[
+        ("preprocess", preprocess),
+        ("model", base_model),
+    ])
+
+    # Calibrated model for trustworthy user-facing probabilities
+    try:
+        production_model = CalibratedClassifierCV(
+            estimator=base_pipeline,
+            method="isotonic",
+            cv=5,
+        )
+    except TypeError:
+        # Older sklearn compatibility
+        production_model = CalibratedClassifierCV(
+            base_estimator=base_pipeline,
+            method="isotonic",
+            cv=5,
+        )
+
+    production_model.fit(X, y)
+
+    model_bundle = {
+        "model": production_model,
+        "model_name": "LogisticRegression_calibrated",
+        "base_model_name": "LogisticRegression",
+        "is_calibrated": True,
+        "calibration_method": "isotonic",
+        "decision_threshold": float(decision_threshold),
+        "target": target,
+        "feature_cols": feature_cols,
+        "trained_rows": int(len(df_model)),
+        "positive_rate": float(y.mean()),
+        "description": (
+            "Production next-day delay-risk model: "
+            "features at day t -> calibrated P(risk on day t+1)"
+        ),
+    }
 
     model_path = Path(model_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
+
     with model_path.open("wb") as f:
-        pickle.dump(model, f)
-    logger.info("  Saved daily model → %s", model_path)
+        pickle.dump(model_bundle, f)
+
+    logger.info("  Saved calibrated next-day model → %s", model_path)
+    logger.info("  Feature count: %d", len(feature_cols))
+    logger.info("  Positive rate: %.4f", float(y.mean()))
+    logger.info("  Decision threshold: %.2f", decision_threshold)
 
     return {
-        "rows_trained":   int(model.trained_on_rows),
-        "n_features":     len(model._feature_cols) + len(model._city_cols),
-        "positive_rate":  round(model._global_rate, 4),
-        "model_path":     str(model_path),
-        "model_type":     model.model_type,
+        "rows_trained": int(len(df_model)),
+        "n_features": int(len(feature_cols)),
+        "positive_rate": round(float(y.mean()), 4),
+        "model_path": str(model_path),
+        "model_type": "LogisticRegression_calibrated",
+        "target": target,
+        "decision_threshold": float(decision_threshold),
+        "is_calibrated": True,
     }
+
+
+
 
 
 def build_climatology(
@@ -651,6 +609,18 @@ def predict_next_month(
         raise FileNotFoundError(
             f"No climatology at {climatology_path} — run build_climatology() first"
         )
+    
+    # Support production model bundle
+    if isinstance(model, dict):
+        model_bundle = model
+        model_object = model_bundle["model"]
+        model_feature_cols = model_bundle.get("feature_cols", [])
+        threshold = model_bundle.get("decision_threshold", threshold)
+    else:
+        # Legacy fallback, kept only so older pickles do not instantly break
+        model_bundle = None
+        model_object = model
+        model_feature_cols = []
 
     # Plan the horizon
     target_month = _resolve_target_month(conn, target_month)
@@ -662,6 +632,16 @@ def predict_next_month(
     forecast_df = _try_fetch_forecast(
         cities, CITIES, today, short_horizon_end, FORECAST_VARIABLES,
     )
+
+    forecast_features_df = None
+
+    if forecast_df is not None and model_feature_cols:
+        forecast_features_df = _build_forecast_features_with_lookback(
+            conn=conn,
+            forecast_df=forecast_df,
+            feature_cols=model_feature_cols,
+            lookback_days=7,
+        )
 
     # Build forecast features using a 7-day lookback window.
     # This is required for lag/change/rolling features.
@@ -690,7 +670,6 @@ def predict_next_month(
             )
 
             if use_short_horizon:
-                # Use engineered forecast features, not raw forecast rows.
                 if forecast_features_df is not None and len(forecast_features_df) > 0:
                     fc_row = forecast_features_df[
                         (forecast_features_df["city"] == city)
@@ -700,19 +679,25 @@ def predict_next_month(
                     fc_row = pd.DataFrame()
 
                 if len(fc_row) == 0:
-                    # Forecast did not cover this day, or features could not be built.
+                    # Forecast did not cover this day or features could not be built
                     p = clim.predict_proba(city, day_of_year)
                     src = "climatology"
                 else:
                     fc_row = fc_row.copy()
 
-                    # Ensure the row has the exact columns the trained model expects.
                     if model_feature_cols:
                         for col in model_feature_cols:
                             if col not in fc_row.columns:
                                 fc_row[col] = np.nan
 
-                    p = float(model.predict_proba(fc_row)[:, 1][0])
+                        X_row = fc_row[model_feature_cols].copy()
+                        p = float(model_object.predict_proba(X_row)[:, 1][0])
+                    else:
+                        # Legacy fallback
+                        if "month" not in fc_row.columns:
+                            fc_row["month"] = d.month
+                        p = float(model_object.predict_proba(fc_row)[:, 1][0])
+
                     src = "short_horizon"
             else:
                 p = clim.predict_proba(city, day_of_year)
